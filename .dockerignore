@@ -1,0 +1,9 @@
+.git
+.env
+.dev.vars
+auth.json
+data
+dist
+node_modules
+spikes
+*.log

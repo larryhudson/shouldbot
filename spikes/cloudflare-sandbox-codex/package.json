@@ -1,0 +1,32 @@
+{
+  "name": "cloudflare-sandbox-codex",
+  "version": "1.0.0",
+  "description": "Throwaway spike for Flue + Cloudflare Sandbox + OpenAI Codex OAuth",
+  "scripts": {
+    "build": "flue build --target cloudflare",
+    "check": "tsc --noEmit && npm run build && wrangler deploy --dry-run --config dist/shouldbot_cloudflare_spike/wrangler.json",
+    "dev": "flue dev --target cloudflare",
+    "login:codex": "pi-ai login openai-codex",
+    "seed:codex": "node scripts/seed-codex-vars.mjs",
+    "verify:codex": "node scripts/verify-codex-direct.mjs",
+    "run": "flue run --target cloudflare sandbox-codex"
+  },
+  "keywords": [],
+  "author": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/sandbox": "^0.12.3",
+    "@earendil-works/pi-ai": "^0.80.6",
+    "@flue/runtime": "^1.0.0-beta.9",
+    "agents": "^0.14.5",
+    "valibot": "^1.4.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260712.1",
+    "@flue/cli": "^1.0.0-beta.9",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.110.0"
+  }
+}
