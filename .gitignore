@@ -5,9 +5,6 @@ auth.json
 data/
 *.log
 
-# Local reflection inputs contain private personal material.
-brain-dump-*.md
-
 # Generated Flue/Vite build metadata may contain machine-local paths.
 .flue-vite/
 .flue-vite.wrangler.jsonc
