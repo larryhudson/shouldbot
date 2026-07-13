@@ -13,17 +13,23 @@ import {
   type SelectedCodexCredential,
 } from '../auth/codex-credential-pool.js';
 import { DockerGitClient } from '../github/docker-git-client.js';
-import instructions from '../instructions/shouldbot.md' with { type: 'markdown' };
-import { createMemoryTools } from '../memory/memory-tools.js';
+import instructions from '../instructions/daily.md' with { type: 'markdown' };
+import { dailyArtifactPath, renderDailyArtifact } from '../memory/generated-artifacts.js';
+import { createMemoryReadTools } from '../memory/memory-tools.js';
 import { MemoryBranchConflictError } from '../memory/memory-transaction.js';
 import { MemoryWorkspace } from '../memory/memory-workspace.js';
 import { getServices, type ShouldbotServices } from '../runtime/services.js';
 import { docker, type DockerContainer } from '../sandboxes/docker.js';
-import { londonDate } from '../time/london.js';
+import { LONDON_TIME_ZONE, londonDate } from '../time/london.js';
 
+// Keep Flue's standard workflow endpoint available as a manual recovery path.
 export const route: WorkflowRouteHandler = async (_context, next) => next();
 
-interface ActiveRun {
+const generatedDailySchema = v.object({
+  message: v.pipe(v.string(), v.minLength(1), v.maxLength(2_000)),
+});
+
+interface ActiveDailyRun {
   id: string;
   services: ShouldbotServices;
   container: DockerContainer;
@@ -35,13 +41,11 @@ interface ActiveRun {
   cleaned: boolean;
 }
 
-let activeRun: ActiveRun | undefined;
+let activeRun: ActiveDailyRun | undefined;
 let initializing = false;
 
 const agent = defineAgent(async ({ id }) => {
-  if (initializing || activeRun) {
-    throw new ReflectionAlreadyRunningError();
-  }
+  if (initializing || activeRun) throw new DailyGenerationAlreadyRunningError();
   initializing = true;
   const services = await getServices();
   let container: DockerContainer | undefined;
@@ -75,8 +79,8 @@ const agent = defineAgent(async ({ id }) => {
       instructions,
       model: `openai-codex/${services.config.codex.model}`,
       sandbox: fixedSandbox(sessionEnv),
-      thinkingLevel: services.config.codex.reasoningLevel,
-      tools: createMemoryTools(memory),
+      thinkingLevel: 'low',
+      tools: createMemoryReadTools(memory),
     };
   } catch (error) {
     if (container) await services.sandboxManager.destroy(container).catch(() => undefined);
@@ -88,41 +92,38 @@ const agent = defineAgent(async ({ id }) => {
 
 export default defineWorkflow({
   agent,
-  input: v.object({
-    reflection: v.pipe(
-      v.string(),
-      v.maxLength(100_000),
-      v.check((value) => value.trim().length > 0, 'Reflection must not be empty.'),
-    ),
-  }),
+  input: v.object({}),
   output: v.object({
-    response: v.string(),
+    message: v.string(),
+    generatedAt: v.string(),
+    localDate: v.string(),
     memoryRevision: v.string(),
     changedPaths: v.array(v.string()),
   }),
-  async run({ harness, input }) {
+  async run({ harness }) {
     const run = requireActiveRun();
     try {
-      const date = londonDate(new Date());
-      const reflectionPath = await run.memory.saveReflection({
-        date,
-        id: run.id,
-        description: `Original reflection submitted on ${date}`,
-        original: input.reflection,
-      });
-      const protectedReflection = await run.memory.read(reflectionPath);
-      const response = await promptWithFailover(run, harness.session(), input.reflection);
+      const generatedAt = new Date();
+      const localDate = londonDate(generatedAt);
+      const response = await promptWithFailover(run, harness.session(), localDate);
+      await run.memory.writeDocument(
+        dailyArtifactPath(generatedAt),
+        renderDailyArtifact(response.data.message, generatedAt),
+      );
       const changedPaths = await run.git.changedPaths();
-      await run.memory.validateWorkspace({
-        changedPaths,
-        protectedReflections: { [reflectionPath]: protectedReflection },
-      });
+      await run.memory.validateWorkspace({ changedPaths });
       const currentSha = await run.git.remoteHead();
       if (currentSha !== run.startingSha) {
         throw new MemoryBranchConflictError(run.startingSha, currentSha);
       }
-      const memoryRevision = await run.git.commitAndPush(`shouldbot: process reflection ${date}`);
-      return { response: response.text, memoryRevision, changedPaths };
+      const memoryRevision = await run.git.commitAndPush(`shouldbot: generate daily message ${localDate}`);
+      return {
+        message: response.data.message,
+        generatedAt: generatedAt.toISOString(),
+        localDate,
+        memoryRevision,
+        changedPaths,
+      };
     } finally {
       await cleanupActiveRun(run.id);
     }
@@ -130,18 +131,22 @@ export default defineWorkflow({
 });
 
 async function promptWithFailover(
-  run: ActiveRun,
+  run: ActiveDailyRun,
   sessionPromise: Promise<FlueSession>,
-  reflection: string,
+  localDate: string,
 ) {
   const session = await sessionPromise;
+  const prompt = () => session.prompt(
+    `Write today's good morning message. Today is ${localDate} in ${LONDON_TIME_ZONE}.`,
+    { result: generatedDailySchema },
+  );
   try {
-    return await session.prompt(reflection);
+    return await prompt();
   } catch (error) {
     if (!isRateLimitError(error)) throw error;
     return run.services.codexPool.withRateLimitFailover(async (credential) => {
       registerCodexCredential(credential);
-      return session.prompt(reflection);
+      return prompt();
     }, { excludeSources: [run.credential.source] });
   }
 }
@@ -154,14 +159,11 @@ function registerCodexCredential(credential: SelectedCodexCredential): void {
 }
 
 function fixedSandbox(env: SessionEnv) {
-  return {
-    createSessionEnv: async () => env,
-    tools: () => [],
-  };
+  return { createSessionEnv: async () => env, tools: () => [] };
 }
 
-function requireActiveRun(): ActiveRun {
-  if (!activeRun) throw new Error('Reflection run resources were not initialized.');
+function requireActiveRun(): ActiveDailyRun {
+  if (!activeRun) throw new Error('Daily-generation resources were not initialized.');
   return activeRun;
 }
 
@@ -174,11 +176,11 @@ async function cleanupActiveRun(id: string): Promise<void> {
   await run.services.sandboxManager.destroy(run.container);
 }
 
-export class ReflectionAlreadyRunningError extends Error {
-  readonly code = 'reflection_already_running';
+export class DailyGenerationAlreadyRunningError extends Error {
+  readonly code = 'daily_generation_already_running';
 
   constructor() {
-    super('Another reflection is already being processed. Please wait for it to finish.');
-    this.name = 'ReflectionAlreadyRunningError';
+    super('A good morning message is already being generated.');
+    this.name = 'DailyGenerationAlreadyRunningError';
   }
 }

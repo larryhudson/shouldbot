@@ -14,7 +14,9 @@ import {
 } from '../auth/codex-credential-pool.js';
 import { DockerGitClient } from '../github/docker-git-client.js';
 import instructions from '../instructions/prompts.md' with { type: 'markdown' };
+import { promptsArtifactPath, renderPromptsArtifact } from '../memory/generated-artifacts.js';
 import { createMemoryReadTools } from '../memory/memory-tools.js';
+import { MemoryBranchConflictError } from '../memory/memory-transaction.js';
 import { MemoryWorkspace } from '../memory/memory-workspace.js';
 import { getServices, type ShouldbotServices } from '../runtime/services.js';
 import { docker, type DockerContainer } from '../sandboxes/docker.js';
@@ -30,8 +32,10 @@ interface ActivePromptRun {
   id: string;
   services: ShouldbotServices;
   container: DockerContainer;
+  git: DockerGitClient;
+  memory: MemoryWorkspace;
   credential: SelectedCodexCredential;
-  memoryRevision: string;
+  startingSha: string;
   cleanupTimer: NodeJS.Timeout;
   cleaned: boolean;
 }
@@ -60,19 +64,24 @@ const agent = defineAgent(async ({ id }) => {
       authorEmail: services.config.git.authorEmail,
     });
     await git.clone();
-    const memoryRevision = await git.head();
+    const startingSha = await git.head();
     const sessionEnv = await docker(container).createSessionEnv({ id });
     const memory = new MemoryWorkspace({ env: sessionEnv });
     const cleanupTimer = setTimeout(() => void cleanupActiveRun(id), services.config.sandbox.timeoutMs);
     cleanupTimer.unref();
-    activeRun = { id, services, container, credential, memoryRevision, cleanupTimer, cleaned: false };
+    activeRun = {
+      id, services, container, git, memory, credential, startingSha, cleanupTimer, cleaned: false,
+    };
 
     return {
       cwd: '/workspace/memory',
       instructions,
       model: `openai-codex/${services.config.codex.model}`,
       sandbox: fixedSandbox(sessionEnv),
-      thinkingLevel: services.config.codex.reasoningLevel,
+      // Prompt preparation must stay responsive enough for clients such as
+      // Apple Shortcuts, whose HTTP action times out around 30 seconds. The
+      // reflection workflow keeps the configured (typically higher) level.
+      thinkingLevel: 'low',
       tools: createMemoryReadTools(memory),
     };
   } catch (error) {
@@ -90,12 +99,33 @@ export default defineWorkflow({
     prompts: v.array(v.string()),
     invitation: v.string(),
     memoryRevision: v.string(),
+    changedPaths: v.array(v.string()),
+    generatedAt: v.string(),
   }),
   async run({ harness }) {
     const run = requireActiveRun();
     try {
       const response = await promptWithFailover(run, harness.session());
-      return { ...response.data, memoryRevision: run.memoryRevision };
+      const generatedAt = new Date();
+      await run.memory.writeDocument(
+        promptsArtifactPath(generatedAt),
+        renderPromptsArtifact(response.data.prompts, response.data.invitation, generatedAt),
+      );
+      const changedPaths = await run.git.changedPaths();
+      await run.memory.validateWorkspace({ changedPaths });
+      const currentSha = await run.git.remoteHead();
+      if (currentSha !== run.startingSha) {
+        throw new MemoryBranchConflictError(run.startingSha, currentSha);
+      }
+      const memoryRevision = await run.git.commitAndPush(
+        `shouldbot: generate reflection prompts ${generatedAt.toISOString()}`,
+      );
+      return {
+        ...response.data,
+        memoryRevision,
+        changedPaths,
+        generatedAt: generatedAt.toISOString(),
+      };
     } finally {
       await cleanupActiveRun(run.id);
     }

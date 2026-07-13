@@ -16,7 +16,9 @@ The initial scaffold contains:
 - A persistent round-robin Codex credential pool that supports multiple Pi auth files, fails over on confirmed rate limits, reports graceful exhaustion, and atomically saves refreshed credentials.
 - Bounded Flue memory tools for deterministic description indexes, selective reads, and validated writes, plus application-owned create-only source reflections.
 - Authoritative workspace validation for safe paths, Markdown-only content, YAML descriptions, symlink rejection, and reflection preservation before Git persistence.
-- Read-only, dynamically generated reflection-preparation prompts grounded selectively in the latest canonical memory.
+- Persisted, dynamically generated reflection-preparation prompts grounded selectively in the latest canonical memory.
+- A persisted good morning message generated every day at 06:30 Europe/London time.
+- Fast application-owned GET endpoints for Apple Shortcuts and other clients to read generated artifacts from GitHub.
 
 The lifecycle manager intentionally remains separate from the Flue adapter. Flue adapters do not own provider resource lifetime; the Shouldbot application must create the container before harness initialization and destroy it after the complete GitHub transaction.
 
@@ -64,15 +66,40 @@ The workflow permits only one active reflection, creates one disposable Docker s
 
 ## Reflection-prompt workflow
 
-Request 3–5 optional prompts grounded in the latest memory revision:
+Submit generation of 3–5 optional prompts in the background:
 
 ```sh
-curl 'http://localhost:3000/workflows/prompts?wait=result' \
+curl -X POST 'http://localhost:3000/prompts'
+# → 202 { "runId": "..." }
+```
+
+The workflow clones memory into a disposable sandbox and exposes only `list_documents` and `read_document`. Application code persists its structured result as `memory/prompts/<UTC timestamp>.md` in one validated Git commit. Fetch the latest completed set without waiting for model generation:
+
+```sh
+curl 'http://localhost:3000/prompts'
+```
+
+The response contains the prompts, invitation, generation time, London calendar date, memory path, and Git blob SHA. It returns `404 { "error": "prompts_not_ready" }` before the first set exists.
+
+## Daily good morning workflow
+
+While the Node server is running, an overlap-protected schedule admits the daily workflow at **06:30 Europe/London time**, including across GMT/BST changes. The workflow selectively reads current memory and earlier daily messages, then application code writes one canonical `memory/daily/YYYY-MM-DD.md` artifact and commits it to the memory repository.
+
+Fetch today's completed message from an Apple Shortcut or another lightweight client:
+
+```sh
+curl 'http://localhost:3000/daily'
+```
+
+The response contains `message`, `generatedAt`, `localDate`, `path`, and `blobSha`. It returns `404 { "error": "daily_not_ready", "localDate": "..." }` if today's scheduled generation has not completed. To generate or retry it manually, invoke the ordinary Flue endpoint:
+
+```sh
+curl 'http://localhost:3000/workflows/daily?wait=result' \
   -H 'content-type: application/json' \
   --data '{}'
 ```
 
-This workflow clones memory into a disposable sandbox and exposes only `list_documents` and `read_document`. It returns the prompts, a short invitation to use them freely, and the memory revision they came from. It never writes memory or creates a Git commit.
+The schedule is process-local: the Node server must be alive at 06:30, and only one scheduler-owning application process should run. A deployment that requires catch-up after downtime or coordination across replicas should invoke `/workflows/daily` from a persistent external scheduler instead.
 
 ## Security boundaries
 

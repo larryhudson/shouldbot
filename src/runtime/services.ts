@@ -1,14 +1,17 @@
 import { CodexCredentialPool } from '../auth/codex-credential-pool.js';
 import { loadConfig } from '../config.js';
 import { GitHubAppTokenBroker } from '../github/app-token-broker.js';
+import { MemoryRepositoryReader } from '../github/memory-repository-reader.js';
 import { DockerSandboxManager } from '../sandboxes/docker-manager.js';
 
 export async function createServices() {
   const config = await loadConfig();
+  const tokenBroker = await GitHubAppTokenBroker.fromConfig(config);
   return {
     config,
     codexPool: new CodexCredentialPool(config.codex.authDirectory),
-    tokenBroker: await GitHubAppTokenBroker.fromConfig(config),
+    tokenBroker,
+    memoryReader: new MemoryRepositoryReader({ config, tokenBroker }),
     sandboxManager: new DockerSandboxManager({
       image: config.sandbox.image,
       memory: config.sandbox.memory,
